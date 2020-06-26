@@ -1,5 +1,7 @@
 <img src="smux.png" alt="smux" height="35px" />
 
+This is a wire-incompatible fork of smux that modifies packet packing and padding behavior.
+
 [![GoDoc][1]][2] [![MIT licensed][3]][4] [![Build Status][5]][6] [![Go Report Card][7]][8] [![Coverage Statusd][9]][10] [![Sourcegraph][11]][12]
 
 <img src="mux.jpg" alt="smux" height="120px" /> 
