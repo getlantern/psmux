@@ -38,6 +38,19 @@ type Config struct {
 	// MaxStreamBuffer is used to control the maximum
 	// number of data per stream
 	MaxStreamBuffer int
+
+	// MaxPadding is used to control the maximum
+	// random padding bytes added to small writes on
+	// the connection.
+	MaxPadding int
+
+	// MaxPaddedWrite is used to control the maximum
+	// sized write that is considered small enough to
+	// pad.  Writes larger than this are not padded
+	// and small writes are not padded beyond this
+	// size.  Padding may also be limited by providing
+	// a Conn fulfilling the PayloadSizer interface.
+	MaxPaddedWrite int
 }
 
 // DefaultConfig is used to return a default configuration
@@ -49,6 +62,8 @@ func DefaultConfig() *Config {
 		MaxFrameSize:      32768,
 		MaxReceiveBuffer:  4194304,
 		MaxStreamBuffer:   65536,
+		MaxPadding:        512,
+		MaxPaddedWrite:    1200,
 	}
 }
 
@@ -83,6 +98,18 @@ func VerifyConfig(config *Config) error {
 	if config.MaxStreamBuffer > math.MaxInt32 {
 		return errors.New("max stream buffer cannot be larger than 2147483647")
 	}
+	if config.MaxPadding < 0 {
+		return errors.New("max padding cannot be negative.")
+	}
+	if config.MaxPadding > (config.MaxFrameSize - headerSize) {
+		return errors.New("max padding cannot exceed maximum payload size.")
+	}
+	if config.MaxPaddedWrite < 0 {
+		return errors.New("max padded write cannot be negative.")
+	}
+	if config.MaxPaddedWrite > config.MaxFrameSize {
+		return errors.New("max padded write cannot exceed maximum frame size.")
+	}
 	return nil
 }
 
@@ -107,4 +134,11 @@ func Client(conn io.ReadWriteCloser, config *Config) (*Session, error) {
 		return nil, err
 	}
 	return newSession(config, conn, true), nil
+}
+
+// If the Conn given to psmux fulfills this interface,
+// the size returned will be used to limit the amount
+// of padding added to a small write.
+type PayloadSizer interface {
+	MaxPayloadSize() int
 }

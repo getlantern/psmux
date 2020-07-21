@@ -967,6 +967,73 @@ func TestWriteDeadline(t *testing.T) {
 	session.Close()
 }
 
+type LimiterConn struct {
+	net.Conn
+	MaxPayload int
+}
+
+func (c *LimiterConn) MaxPayloadSize() int {
+	return c.MaxPayload
+}
+
+func (c *LimiterConn) Write(b []byte) (int, error) {
+	if len(b) > c.MaxPayload {
+		return 0, fmt.Errorf("Write exceeded max payload... %v > %v", len(b), c.MaxPayload)
+	}
+	return c.Conn.Write(b)
+}
+
+// LimiterConn fulfills PayloadSizer interface
+var _ PayloadSizer = &LimiterConn{}
+
+func TestPsmuxPaddingLimits(t *testing.T) {
+	_, stop, cli, err := setupServer(t)
+	defer stop()
+	maxPayload := 128
+	lcli := &LimiterConn{cli, maxPayload}
+
+	config := DefaultConfig()
+	config.MaxPadding = 2 * maxPayload
+	config.MaxPaddedWrite = 2 * maxPayload
+
+	session, err := Client(lcli, config)
+
+	// writing anything above the max payload size is considered an error...
+	_, err = lcli.Write(make([]byte, maxPayload+1))
+	if err == nil {
+		t.Fatal("expected error writing payload")
+	}
+
+	// padding on the connection should never trigger this error
+	// ie the max payload should be respected although other parameters
+	// allow it...
+	stream, err := session.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hi := []byte("hi")
+	n, err := stream.Write(hi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// read it back ... (should flush and echo)
+	if n, err = stream.Read(hi); err != nil {
+		t.Fatal(err)
+	}
+
+	// write something that is at the limit according to the
+	// LimiterConn but would otherwise be padded
+	sz := maxPayload - headerSize
+	n, err = stream.Write(make([]byte, sz))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != sz {
+		t.Fatalf("expected write size %v", sz)
+	}
+}
+
 func BenchmarkAcceptClose(b *testing.B) {
 	_, stop, cli, err := setupServer(b)
 	if err != nil {

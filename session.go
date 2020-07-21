@@ -450,12 +450,18 @@ func (s *Session) shaperLoop() {
 func (s *Session) sendLoop() {
 	buf := make([]byte, 0, (1<<16)+headerSize)
 	hbuf := make([]byte, headerSize)
-	flushTarget := 8192
 	ackList := make([]writeRequest, 0, 8)
 
-	padTarget := 1397
+	// the buffer is allowed to grow beyond this size to service
+	// very large writes, but we will not keep coalescing after the
+	// buffer is "full" with respect to its initial size.
+	flushMax := cap(buf)
+	// the minimum deliverable padding frame size.
+	// since at least a header (with 0 data length) is
+	// required, total padding cannot be less than the
+	// header size.
 	minPadding := headerSize
-	maxPadding := 512
+	maxPadding := s.config.MaxPadding
 	padBuf := make([]byte, maxPadding)
 	padBuf[0] = byte(s.config.Version)
 	padBuf[1] = cmdNOP
@@ -489,10 +495,10 @@ func (s *Session) sendLoop() {
 			return
 		case request := <-s.writes:
 			_pack(request)
-			if request.flush || len(buf) >= flushTarget {
+			if request.flush || len(buf) >= flushMax {
 				// maybe coalesce additional pending writes ...
 				done := false
-				for !done && len(buf) < flushTarget {
+				for !done && len(buf) < flushMax {
 					select {
 					case request = <-s.writes:
 						_pack(request)
@@ -502,8 +508,15 @@ func (s *Session) sendLoop() {
 				}
 
 				// maybe pad ...
-				if len(buf)+minPadding <= padTarget {
-					padSize := padTarget - len(buf)
+				maxPaddedWrite := s.config.MaxPaddedWrite
+				if sizer, ok := s.conn.(PayloadSizer); ok {
+					maxPayload := sizer.MaxPayloadSize()
+					if maxPayload < maxPaddedWrite {
+						maxPaddedWrite = maxPayload
+					}
+				}
+				if len(buf)+minPadding <= maxPaddedWrite {
+					padSize := maxPaddedWrite - len(buf)
 					if padSize > maxPadding {
 						padSize = maxPadding
 					}
