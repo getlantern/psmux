@@ -1,4 +1,4 @@
-package smux
+package psmux
 
 import (
 	"bytes"
@@ -867,7 +867,7 @@ func TestWriteFrameInternal(t *testing.T) {
 	session.Close()
 	for i := 0; i < 100; i++ {
 		f := newFrame(1, byte(rand.Uint32()), rand.Uint32())
-		session.writeFrameInternal(f, time.After(session.config.KeepAliveTimeout), 0)
+		session.writeFrameInternal(f, time.After(session.config.KeepAliveTimeout), 0, true)
 	}
 
 	// random cmds
@@ -879,14 +879,14 @@ func TestWriteFrameInternal(t *testing.T) {
 	session, _ = Client(cli, nil)
 	for i := 0; i < 100; i++ {
 		f := newFrame(1, allcmds[rand.Int()%len(allcmds)], rand.Uint32())
-		session.writeFrameInternal(f, time.After(session.config.KeepAliveTimeout), 0)
+		session.writeFrameInternal(f, time.After(session.config.KeepAliveTimeout), 0, true)
 	}
 	//deadline occur
 	{
 		c := make(chan time.Time)
 		close(c)
 		f := newFrame(1, allcmds[rand.Int()%len(allcmds)], rand.Uint32())
-		_, err := session.writeFrameInternal(f, c, 0)
+		_, err := session.writeFrameInternal(f, c, 0, true)
 		if !strings.Contains(err.Error(), "timeout") {
 			t.Fatal("write frame with deadline failed", err)
 		}
@@ -911,7 +911,7 @@ func TestWriteFrameInternal(t *testing.T) {
 			time.Sleep(time.Second)
 			close(c)
 		}()
-		_, err = session.writeFrameInternal(f, c, 0)
+		_, err = session.writeFrameInternal(f, c, 0, true)
 		if !strings.Contains(err.Error(), "closed pipe") {
 			t.Fatal("write frame with to closed conn failed", err)
 		}
@@ -965,6 +965,73 @@ func TestWriteDeadline(t *testing.T) {
 		}
 	}
 	session.Close()
+}
+
+type LimiterConn struct {
+	net.Conn
+	MaxPayload int
+}
+
+func (c *LimiterConn) MaxPayloadSize() int {
+	return c.MaxPayload
+}
+
+func (c *LimiterConn) Write(b []byte) (int, error) {
+	if len(b) > c.MaxPayload {
+		return 0, fmt.Errorf("Write exceeded max payload... %v > %v", len(b), c.MaxPayload)
+	}
+	return c.Conn.Write(b)
+}
+
+// LimiterConn fulfills PayloadSizer interface
+var _ PayloadSizer = &LimiterConn{}
+
+func TestPsmuxPaddingLimits(t *testing.T) {
+	_, stop, cli, err := setupServer(t)
+	defer stop()
+	maxPayload := 128
+	lcli := &LimiterConn{cli, maxPayload}
+
+	config := DefaultConfig()
+	config.MaxPadding = 2 * maxPayload
+	config.MaxPaddedWrite = 2 * maxPayload
+
+	session, err := Client(lcli, config)
+
+	// writing anything above the max payload size is considered an error...
+	_, err = lcli.Write(make([]byte, maxPayload+1))
+	if err == nil {
+		t.Fatal("expected error writing payload")
+	}
+
+	// padding on the connection should never trigger this error
+	// ie the max payload should be respected although other parameters
+	// allow it...
+	stream, err := session.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hi := []byte("hi")
+	n, err := stream.Write(hi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// read it back ... (should flush and echo)
+	if n, err = stream.Read(hi); err != nil {
+		t.Fatal(err)
+	}
+
+	// write something that is at the limit according to the
+	// LimiterConn but would otherwise be padded
+	sz := maxPayload - headerSize
+	n, err = stream.Write(make([]byte, sz))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != sz {
+		t.Fatalf("expected write size %v", sz)
+	}
 }
 
 func BenchmarkAcceptClose(b *testing.B) {
@@ -1024,7 +1091,7 @@ func getSmuxStreamPair() (*Stream, *Stream, error) {
 		done <- rerr
 		close(done)
 	}()
-	cs, err := c.OpenStream()
+	cs, err := c.openStreamInternal(true)
 	if err != nil {
 		return nil, nil, err
 	}

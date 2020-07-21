@@ -1,10 +1,12 @@
-package smux
+package psmux
 
 import (
 	"container/heap"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"io"
+	"math/big"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -27,15 +29,12 @@ type writeRequest struct {
 	prio   uint64
 	frame  Frame
 	result chan writeResult
+	flush  bool
 }
 
 type writeResult struct {
 	n   int
 	err error
-}
-
-type buffersWriter interface {
-	WriteBuffers(v [][]byte) (n int, err error)
 }
 
 // Session defines a multiplexed connection for streams
@@ -112,6 +111,10 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 
 // OpenStream is used to create a new stream
 func (s *Session) OpenStream() (*Stream, error) {
+	return s.openStreamInternal(false)
+}
+
+func (s *Session) openStreamInternal(immediate bool) (*Stream, error) {
 	if s.IsClosed() {
 		return nil, io.ErrClosedPipe
 	}
@@ -134,7 +137,7 @@ func (s *Session) OpenStream() (*Stream, error) {
 
 	stream := newStream(sid, s.config.MaxFrameSize, s)
 
-	if _, err := s.writeFrame(newFrame(byte(s.config.Version), cmdSYN, sid)); err != nil {
+	if _, err := s.writeFrameInternal(newFrame(byte(s.config.Version), cmdSYN, sid), nil, 0, immediate); err != nil {
 		return nil, err
 	}
 
@@ -326,6 +329,16 @@ func (s *Session) recvLoop() {
 			sid := hdr.StreamID()
 			switch hdr.Cmd() {
 			case cmdNOP:
+				padding := int(hdr.Length())
+				if padding > 0 {
+					newbuf := defaultAllocator.Get(padding)
+					_, err := io.ReadFull(s.conn, newbuf)
+					defaultAllocator.Put(newbuf)
+					if err != nil {
+						s.notifyReadError(err)
+						return
+					}
+				}
 			case cmdSYN:
 				s.streamLock.Lock()
 				if _, ok := s.streams[sid]; !ok {
@@ -390,7 +403,7 @@ func (s *Session) keepalive() {
 	for {
 		select {
 		case <-tickerPing.C:
-			s.writeFrameInternal(newFrame(byte(s.config.Version), cmdNOP, 0), tickerPing.C, 0)
+			s.writeFrameInternal(newFrame(byte(s.config.Version), cmdNOP, 0), tickerPing.C, 0, true)
 			s.notifyBucket() // force a signal to the recvLoop
 		case <-tickerTimeout.C:
 			if !atomic.CompareAndSwapInt32(&s.dataReady, 1, 0) {
@@ -435,17 +448,45 @@ func (s *Session) shaperLoop() {
 }
 
 func (s *Session) sendLoop() {
-	var buf []byte
-	var n int
-	var err error
-	var vec [][]byte // vector for writeBuffers
+	buf := make([]byte, 0, (1<<16)+headerSize)
+	hbuf := make([]byte, headerSize)
+	ackList := make([]writeRequest, 0, 8)
 
-	bw, ok := s.conn.(buffersWriter)
-	if ok {
-		buf = make([]byte, headerSize)
-		vec = make([][]byte, 2)
-	} else {
-		buf = make([]byte, (1<<16)+headerSize)
+	// the buffer is allowed to grow beyond this size to service
+	// very large writes, but we will not keep coalescing after the
+	// buffer is "full" with respect to its initial size.
+	flushMax := cap(buf)
+	// the minimum deliverable padding frame size.
+	// since at least a header (with 0 data length) is
+	// required, total padding cannot be less than the
+	// header size.
+	minPadding := headerSize
+	maxPadding := s.config.MaxPadding
+	padBuf := make([]byte, maxPadding)
+	padBuf[0] = byte(s.config.Version)
+	padBuf[1] = cmdNOP
+
+	_pack := func(request writeRequest) {
+		sz := len(request.frame.data)
+		hbuf[0] = request.frame.ver
+		hbuf[1] = request.frame.cmd
+		binary.LittleEndian.PutUint16(hbuf[2:], uint16(sz))
+		binary.LittleEndian.PutUint32(hbuf[4:], request.frame.sid)
+		buf = append(buf, hbuf...)
+		buf = append(buf, request.frame.data...)
+		ackList = append(ackList, request)
+	}
+
+	_ack := func(err error) {
+		for _, request := range ackList {
+			if err != nil {
+				request.result <- writeResult{0, err}
+			} else {
+				request.result <- writeResult{len(request.frame.data), nil}
+			}
+			close(request.result)
+		}
+		ackList = ackList[:0]
 	}
 
 	for {
@@ -453,38 +494,53 @@ func (s *Session) sendLoop() {
 		case <-s.die:
 			return
 		case request := <-s.writes:
-			buf[0] = request.frame.ver
-			buf[1] = request.frame.cmd
-			binary.LittleEndian.PutUint16(buf[2:], uint16(len(request.frame.data)))
-			binary.LittleEndian.PutUint32(buf[4:], request.frame.sid)
+			_pack(request)
+			if request.flush || len(buf) >= flushMax {
+				// maybe coalesce additional pending writes ...
+				done := false
+				for !done && len(buf) < flushMax {
+					select {
+					case request = <-s.writes:
+						_pack(request)
+					default:
+						done = true
+					}
+				}
 
-			if len(vec) > 0 {
-				vec[0] = buf[:headerSize]
-				vec[1] = request.frame.data
-				n, err = bw.WriteBuffers(vec)
-			} else {
-				copy(buf[headerSize:], request.frame.data)
-				n, err = s.conn.Write(buf[:headerSize+len(request.frame.data)])
+				// maybe pad ...
+				maxPaddedWrite := s.config.MaxPaddedWrite
+				if sizer, ok := s.conn.(PayloadSizer); ok {
+					maxPayload := sizer.MaxPayloadSize()
+					if maxPayload < maxPaddedWrite {
+						maxPaddedWrite = maxPayload
+					}
+				}
+				if len(buf)+minPadding <= maxPaddedWrite {
+					padSize := maxPaddedWrite - len(buf)
+					if padSize > maxPadding {
+						padSize = maxPadding
+					}
+					pbig, err := rand.Int(rand.Reader, big.NewInt(int64(padSize-minPadding)))
+					if err != nil {
+						s.notifyWriteError(err)
+						_ack(err)
+						return
+					}
+					padSize = int(pbig.Int64() + int64(minPadding))
+					binary.LittleEndian.PutUint16(padBuf[2:], uint16(padSize-headerSize))
+					buf = append(buf, padBuf[:padSize]...)
+				}
+
+				// flush
+				_, err := s.conn.Write(buf)
+				buf = buf[:0]
+				if err != nil {
+					s.notifyWriteError(err)
+					_ack(err)
+					return
+				}
 			}
-
-			n -= headerSize
-			if n < 0 {
-				n = 0
-			}
-
-			result := writeResult{
-				n:   n,
-				err: err,
-			}
-
-			request.result <- result
-			close(request.result)
-
-			// store conn error
-			if err != nil {
-				s.notifyWriteError(err)
-				return
-			}
+			_ack(nil)
 		}
 	}
 }
@@ -492,15 +548,16 @@ func (s *Session) sendLoop() {
 // writeFrame writes the frame to the underlying connection
 // and returns the number of bytes written if successful
 func (s *Session) writeFrame(f Frame) (n int, err error) {
-	return s.writeFrameInternal(f, nil, 0)
+	return s.writeFrameInternal(f, nil, 0, false)
 }
 
 // internal writeFrame version to support deadline used in keepalive
-func (s *Session) writeFrameInternal(f Frame, deadline <-chan time.Time, prio uint64) (int, error) {
+func (s *Session) writeFrameInternal(f Frame, deadline <-chan time.Time, prio uint64, flush bool) (int, error) {
 	req := writeRequest{
 		prio:   prio,
 		frame:  f,
 		result: make(chan writeResult, 1),
+		flush:  flush,
 	}
 	select {
 	case s.shaper <- req:

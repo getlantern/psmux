@@ -1,4 +1,4 @@
-package smux
+package psmux
 
 import (
 	"encoding/binary"
@@ -255,7 +255,7 @@ func (s *Stream) sendWindowUpdate(consumed uint32) error {
 	binary.LittleEndian.PutUint32(hdr[:], consumed)
 	binary.LittleEndian.PutUint32(hdr[4:], uint32(s.sess.config.MaxStreamBuffer))
 	frame.data = hdr[:]
-	_, err := s.sess.writeFrameInternal(frame, deadline, 0)
+	_, err := s.sess.writeFrameInternal(frame, deadline, 0, true)
 	return err
 }
 
@@ -319,7 +319,7 @@ func (s *Stream) Write(b []byte) (n int, err error) {
 		}
 		frame.data = bts[:sz]
 		bts = bts[sz:]
-		n, err := s.sess.writeFrameInternal(frame, deadline, uint64(s.numWritten))
+		n, err := s.sess.writeFrameInternal(frame, deadline, uint64(s.numWritten), true)
 		s.numWritten++
 		sent += n
 		if err != nil {
@@ -387,7 +387,7 @@ func (s *Stream) writeV2(b []byte) (n int, err error) {
 				}
 				frame.data = bts[:sz]
 				bts = bts[sz:]
-				n, err := s.sess.writeFrameInternal(frame, deadline, uint64(atomic.LoadUint32(&s.numWritten)))
+				n, err := s.sess.writeFrameInternal(frame, deadline, uint64(atomic.LoadUint32(&s.numWritten)), true)
 				atomic.AddUint32(&s.numWritten, uint32(sz))
 				sent += n
 				if err != nil {
@@ -428,7 +428,7 @@ func (s *Stream) Close() error {
 	})
 
 	if once {
-		_, err = s.sess.writeFrame(newFrame(byte(s.sess.config.Version), cmdFIN, s.id))
+		_, err = s.sess.writeFrameInternal(newFrame(byte(s.sess.config.Version), cmdFIN, s.id), nil, 0, true)
 		s.sess.streamClosed(s.id)
 		return err
 	} else {

@@ -1,4 +1,4 @@
-package smux
+package psmux
 
 import (
 	"container/heap"
