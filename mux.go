@@ -39,31 +39,54 @@ type Config struct {
 	// number of data per stream
 	MaxStreamBuffer int
 
-	// MaxPadding is used to control the maximum
-	// random padding bytes added to small writes on
-	// the connection.
-	MaxPadding int
+	// MaxPaddingRatio limits padding bytes to a
+	// percentage of the write size and influences
+	// the overall overhead introduced by padding.
+	//
+	// A MaxPaddingRatio of 0.5 allows a write of 100
+	// bytes to be padded by 50 bytes. It also limits
+	// the smallest write that will receive any padding
+	// to 16 (as there is a minimum of 8 padding bytes).
+	// In general, the minimum padded write size
+	// will be ceil(8/MaxPaddingRatio).
+	MaxPaddingRatio float64
 
-	// MaxPaddedWrite is used to control the maximum
-	// sized write that is considered small enough to
-	// pad.  Writes larger than this are not padded
-	// and small writes are not padded beyond this
-	// size.  Padding may also be limited by providing
-	// a Conn fulfilling the PayloadSizer interface.
-	MaxPaddedWrite int
+	// MaxPaddedSize determines the maximum sized write
+	// that will be padded.  Writes larger than this are
+	// not padded and small writes are not padded beyond this
+	// size.
+	MaxPaddedSize int
+
+	// AggressivePadding enables aggressive (large) padding for this
+	// number of initial writes in a session as determined by
+	// AggressivePaddingRatio.
+	//
+	// The overhead bytes contributed by aggressive padding are bounded above by:
+	// min(1.0, AgressivePaddingRatio)*(MaxPaddedSize*AggressivePadding).
+	// Unless AgressivePaddingRatio >> 1.0 and writes are
+	// very small, it is generally far less in practice due to
+	// write distribution and random selection of padding amounts.
+	AggressivePadding int
+
+	// AggressiveRatio sets the max padding ratio for aggressive
+	// initial padding.  The total padding is still bounded
+	// by MaxPaddedSize for any given write.
+	AggressivePaddingRatio float64
 }
 
 // DefaultConfig is used to return a default configuration
 func DefaultConfig() *Config {
 	return &Config{
-		Version:           1,
-		KeepAliveInterval: 10 * time.Second,
-		KeepAliveTimeout:  30 * time.Second,
-		MaxFrameSize:      32768,
-		MaxReceiveBuffer:  4194304,
-		MaxStreamBuffer:   65536,
-		MaxPadding:        512,
-		MaxPaddedWrite:    1200,
+		Version:                1,
+		KeepAliveInterval:      10 * time.Second,
+		KeepAliveTimeout:       30 * time.Second,
+		MaxFrameSize:           32768,
+		MaxReceiveBuffer:       4194304,
+		MaxStreamBuffer:        65536,
+		MaxPaddingRatio:        0.10,
+		MaxPaddedSize:          1200,
+		AggressivePadding:      16,
+		AggressivePaddingRatio: 0.3,
 	}
 }
 
@@ -98,17 +121,20 @@ func VerifyConfig(config *Config) error {
 	if config.MaxStreamBuffer > math.MaxInt32 {
 		return errors.New("max stream buffer cannot be larger than 2147483647")
 	}
-	if config.MaxPadding < 0 {
-		return errors.New("max padding cannot be negative.")
+	if config.MaxPaddingRatio < 0 {
+		return errors.New("max padding ratio cannot be negative.")
 	}
-	if config.MaxPadding > (config.MaxFrameSize - headerSize) {
-		return errors.New("max padding cannot exceed maximum payload size.")
+	if config.MaxPaddedSize < 0 {
+		return errors.New("max padded size cannot be negative.")
 	}
-	if config.MaxPaddedWrite < 0 {
-		return errors.New("max padded write cannot be negative.")
+	if config.MaxPaddedSize > config.MaxFrameSize {
+		return errors.New("max padded size cannot exceed maximum frame size.")
 	}
-	if config.MaxPaddedWrite > config.MaxFrameSize {
-		return errors.New("max padded write cannot exceed maximum frame size.")
+	if config.AggressivePadding < 0 {
+		return errors.New("aggressive padding count cannot be negative.")
+	}
+	if config.AggressivePaddingRatio < 0 {
+		return errors.New("aggressive padding ratio cannot be negative.")
 	}
 	return nil
 }
@@ -134,11 +160,4 @@ func Client(conn io.ReadWriteCloser, config *Config) (*Session, error) {
 		return nil, err
 	}
 	return newSession(config, conn, true), nil
-}
-
-// If the Conn given to psmux fulfills this interface,
-// the size returned will be used to limit the amount
-// of padding added to a small write.
-type PayloadSizer interface {
-	MaxPayloadSize() int
 }
