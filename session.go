@@ -6,8 +6,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"math/big"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -464,15 +466,23 @@ func (s *Session) sendLoop() {
 	// very large writes, but we will not keep coalescing after the
 	// buffer is "full" with respect to its initial size.
 	flushMax := cap(buf)
+
 	// the minimum deliverable padding frame size.
 	// since at least a header (with 0 data length) is
 	// required, total padding cannot be less than the
 	// header size.
 	minPadding := headerSize
-	maxPadding := s.config.MaxPadding
+	ratio := s.config.MaxPaddingRatio
+	aggRatio := s.config.AggressivePaddingRatio
+	maxPaddedSize := s.config.MaxPaddedSize
+	maxPadding := int(math.Floor(math.Max(ratio, aggRatio) * float64(maxPaddedSize)))
+	if maxPadding > maxPaddedSize {
+		maxPadding = maxPaddedSize
+	}
 	padBuf := make([]byte, maxPadding)
 	padBuf[0] = byte(s.config.Version)
 	padBuf[1] = cmdNOP
+	aggCount := 0
 
 	_pack := func(request writeRequest) {
 		sz := len(request.frame.data)
@@ -497,6 +507,43 @@ func (s *Session) sendLoop() {
 		ackList = ackList[:0]
 	}
 
+	_maybePad := func() error {
+		pmax := maxPaddedSize - len(buf)
+
+		// pick normal or aggressive padding ratio
+		// depending on number of padded writes performed
+		// in session
+		r := ratio
+		if aggCount < s.config.AggressivePadding {
+			r = aggRatio
+			aggCount += 1
+		}
+
+		// limit max padding size by padding ratio
+		if rmax := int(math.Floor(float64(len(buf)) * r)); rmax < pmax {
+			pmax = rmax
+		}
+
+		var padSize int
+		if pmax > minPadding {
+			// randomly select padding size up to limit
+			pbig, err := rand.Int(rand.Reader, big.NewInt(int64(pmax-minPadding)))
+			if err != nil {
+				return err
+			}
+			padSize = int(pbig.Int64()) + minPadding
+		} else if pmax == minPadding {
+			padSize = minPadding
+		} else { // pmax < minPadding
+			return nil
+		}
+
+		binary.LittleEndian.PutUint16(padBuf[2:], uint16(padSize-headerSize))
+		buf = append(buf, padBuf[:padSize]...)
+
+		return nil
+	}
+
 	for {
 		select {
 		case <-s.die:
@@ -507,6 +554,18 @@ func (s *Session) sendLoop() {
 				// maybe coalesce additional pending writes ...
 				done := false
 				for !done && len(buf) < flushMax {
+					// give other goroutines a shot at writing by
+					// explicitly yielding for a moment before
+					// testing for additional pending writes.
+					// a small linger of 1ms or so could also
+					// be potentially useful for coalescing writes,
+					// but high resolution timers are a bit funky
+					// on windows and require system level changes to
+					// timer resolution that affect power consumption and
+					// other running programs. May eventually be helped by this
+					// https://go-review.googlesource.com/c/go/+/248699/
+					// but not sure it applies to everything necessary...
+					runtime.Gosched()
 					select {
 					case request = <-s.writes:
 						_pack(request)
@@ -514,33 +573,15 @@ func (s *Session) sendLoop() {
 						done = true
 					}
 				}
-
-				// maybe pad ...
-				maxPaddedWrite := s.config.MaxPaddedWrite
-				if sizer, ok := s.conn.(PayloadSizer); ok {
-					maxPayload := sizer.MaxPayloadSize()
-					if maxPayload < maxPaddedWrite {
-						maxPaddedWrite = maxPayload
-					}
-				}
-				if len(buf)+minPadding <= maxPaddedWrite {
-					padSize := maxPaddedWrite - len(buf)
-					if padSize > maxPadding {
-						padSize = maxPadding
-					}
-					pbig, err := rand.Int(rand.Reader, big.NewInt(int64(padSize-minPadding)))
-					if err != nil {
-						s.notifyWriteError(err)
-						_ack(err)
-						return
-					}
-					padSize = int(pbig.Int64() + int64(minPadding))
-					binary.LittleEndian.PutUint16(padBuf[2:], uint16(padSize-headerSize))
-					buf = append(buf, padBuf[:padSize]...)
+				err := _maybePad()
+				if err != nil {
+					s.notifyWriteError(err)
+					_ack(err)
+					return
 				}
 
 				// flush
-				_, err := s.conn.Write(buf)
+				_, err = s.conn.Write(buf)
 				buf = buf[:0]
 				if err != nil {
 					s.notifyWriteError(err)

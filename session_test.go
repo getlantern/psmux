@@ -27,6 +27,10 @@ func init() {
 // returns address of the server, function to stop the server, new client
 // connection to this server or an error.
 func setupServer(tb testing.TB) (addr string, stopfunc func(), client net.Conn, err error) {
+	return setupServerConfig(tb, nil)
+}
+
+func setupServerConfig(tb testing.TB, config *Config) (addr string, stopfunc func(), client net.Conn, err error) {
 	ln, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		return "", nil, nil, err
@@ -36,7 +40,7 @@ func setupServer(tb testing.TB) (addr string, stopfunc func(), client net.Conn, 
 		if err != nil {
 			return
 		}
-		go handleConnection(conn)
+		go handleConnection(conn, config)
 	}()
 	addr = ln.Addr().String()
 	conn, err := net.Dial("tcp", addr)
@@ -47,8 +51,8 @@ func setupServer(tb testing.TB) (addr string, stopfunc func(), client net.Conn, 
 	return ln.Addr().String(), func() { ln.Close() }, conn, nil
 }
 
-func handleConnection(conn net.Conn) {
-	session, _ := Server(conn, nil)
+func handleConnection(conn net.Conn, config *Config) {
+	session, _ := Server(conn, config)
 	for {
 		if stream, err := session.AcceptStream(); err == nil {
 			go func(s io.ReadWriteCloser) {
@@ -979,32 +983,35 @@ func TestWriteDeadline(t *testing.T) {
 
 type LimiterConn struct {
 	net.Conn
-	MaxPayload int
+	maxPayload   int
+	bytesRead    int
+	bytesWritten int
 }
 
-func (c *LimiterConn) MaxPayloadSize() int {
-	return c.MaxPayload
+func (c *LimiterConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.bytesRead += n
+	return n, err
 }
 
 func (c *LimiterConn) Write(b []byte) (int, error) {
-	if len(b) > c.MaxPayload {
-		return 0, fmt.Errorf("Write exceeded max payload... %v > %v", len(b), c.MaxPayload)
+	if len(b) > c.maxPayload {
+		return 0, fmt.Errorf("Write exceeded max payload... %v > %v", len(b), c.maxPayload)
 	}
-	return c.Conn.Write(b)
+	n, err := c.Conn.Write(b)
+	c.bytesWritten += n
+	return n, err
 }
-
-// LimiterConn fulfills PayloadSizer interface
-var _ PayloadSizer = &LimiterConn{}
 
 func TestPsmuxPaddingLimits(t *testing.T) {
 	_, stop, cli, err := setupServer(t)
 	defer stop()
 	maxPayload := 128
-	lcli := &LimiterConn{cli, maxPayload}
+	lcli := &LimiterConn{cli, maxPayload, 0, 0}
 
 	config := DefaultConfig()
-	config.MaxPadding = 2 * maxPayload
-	config.MaxPaddedWrite = 2 * maxPayload
+	config.MaxPaddingRatio = 2.0
+	config.MaxPaddedSize = maxPayload
 
 	session, err := Client(lcli, config)
 
@@ -1041,6 +1048,84 @@ func TestPsmuxPaddingLimits(t *testing.T) {
 	}
 	if n != sz {
 		t.Fatalf("expected write size %v", sz)
+	}
+}
+
+func TestPsmuxAggressivePadding(t *testing.T) {
+	maxPayload := 64
+	agwrites := 10
+	agr := 2.0
+
+	config := DefaultConfig()
+	config.MaxPaddingRatio = 0.0
+	config.MaxPaddedSize = maxPayload
+	config.AggressivePadding = agwrites
+	config.AggressivePaddingRatio = agr
+
+	_, stop, cli, err := setupServerConfig(t, config)
+	defer stop()
+	lcli := &LimiterConn{cli, maxPayload, 0, 0}
+
+	session, err := Client(lcli, config)
+
+	// padding on the connection should never trigger this error
+	// ie the max payload should be respected although other parameters
+	// allow it...
+	stream, err := session.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hi := []byte("hellohellohellohellohellohello")
+	hiSize := len(hi)
+	for i := 0; i < agwrites; i++ {
+		n, err := stream.Write(hi)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// read it back ... (should flush and echo)
+		if n, err = stream.Read(hi); err != nil {
+			t.Fatal(err)
+		}
+		if n != hiSize {
+			t.Fatalf("expected to read %v", hiSize)
+		}
+	}
+
+	expectMin := agwrites * (hiSize + 16)
+	expectMax := agwrites * int(agr*float64(maxPayload))
+	if lcli.bytesWritten < expectMin || lcli.bytesWritten > expectMax {
+		t.Fatalf("Unexpected aggressive padded write size %v, expected range [%v,%v]", lcli.bytesWritten, expectMin, expectMax)
+	}
+	if lcli.bytesRead < expectMin || lcli.bytesRead > expectMax {
+		t.Fatalf("Unexpected aggressive padded read size %v, expected range [%v,%v]", lcli.bytesRead, expectMin, expectMax)
+	}
+	lcli.bytesRead = 0 // reset
+	lcli.bytesWritten = 0
+
+	// the aggressive regime should be over, and no more padding
+	// should occur since MaxPaddingRatio is 0
+	nwrites := 10
+	for i := 0; i < nwrites; i++ {
+		n, err := stream.Write(hi)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// read it back ... (should flush and echo)
+		if n, err = stream.Read(hi); err != nil {
+			t.Fatal(err)
+		}
+		if n != hiSize {
+			t.Fatalf("expected to read %v", hiSize)
+		}
+	}
+
+	expectedSize := nwrites * (hiSize + 8)
+	if lcli.bytesRead != expectedSize {
+		t.Fatalf("Unexpected (normal) padded read size %v, expected %v", lcli.bytesRead, expectedSize)
+	}
+	if lcli.bytesWritten != expectedSize {
+		t.Fatalf("Unexpected (normal) padded write size %v, expected %v", lcli.bytesWritten, expectedSize)
 	}
 }
 
