@@ -508,31 +508,39 @@ func (s *Session) sendLoop() {
 	}
 
 	_maybePad := func() error {
-		maxPaddedSize := s.config.MaxPaddedSize
-		if len(buf)+minPadding <= maxPaddedSize {
-			r := ratio
-			if aggCount < s.config.AggressivePadding {
-				r = aggRatio
-				aggCount += 1
-			}
+		pmax := maxPaddedSize - len(buf)
 
-			padSize := maxPaddedSize - len(buf)
-			rmax := int(math.Floor(float64(len(buf)) * r))
-			if padSize > rmax {
-				padSize = rmax
-			}
-			if padSize > minPadding {
-				pbig, err := rand.Int(rand.Reader, big.NewInt(int64(padSize-minPadding)))
-				if err != nil {
-					return err
-				}
-				padSize = int(pbig.Int64() + int64(minPadding))
-			}
-			if padSize >= minPadding {
-				binary.LittleEndian.PutUint16(padBuf[2:], uint16(padSize-headerSize))
-				buf = append(buf, padBuf[:padSize]...)
-			}
+		// pick normal or aggressive padding ratio
+		// depending on number of padded writes performed
+		// in session
+		r := ratio
+		if aggCount < s.config.AggressivePadding {
+			r = aggRatio
+			aggCount += 1
 		}
+
+		// limit max padding size by padding ratio
+		if rmax := int(math.Floor(float64(len(buf)) * r)); rmax < pmax {
+			pmax = rmax
+		}
+
+		var padSize int
+		if pmax > minPadding {
+			// randomly select padding size up to limit
+			pbig, err := rand.Int(rand.Reader, big.NewInt(int64(pmax-minPadding)))
+			if err != nil {
+				return err
+			}
+			padSize = int(pbig.Int64()) + minPadding
+		} else if pmax == minPadding {
+			padSize = minPadding
+		} else { // pmax < minPadding
+			return nil
+		}
+
+		binary.LittleEndian.PutUint16(padBuf[2:], uint16(padSize-headerSize))
+		buf = append(buf, padBuf[:padSize]...)
+
 		return nil
 	}
 
@@ -546,6 +554,17 @@ func (s *Session) sendLoop() {
 				// maybe coalesce additional pending writes ...
 				done := false
 				for !done && len(buf) < flushMax {
+					// give other goroutines a shot at writing by
+					// explicitly yielding for a moment before
+					// testing for additional pending writes.
+					// a small linger of 1ms or so could also
+					// be potentially useful for coalescing writes,
+					// but high resolution timers are a bit funky
+					// on windows and require system level changes to
+					// timer resolution that affect power consumption and
+					// other running programs. May eventually be helped by this
+					// https://go-review.googlesource.com/c/go/+/248699/
+					// but not sure it applies to everything necessary...
 					runtime.Gosched()
 					select {
 					case request = <-s.writes:

@@ -68,7 +68,7 @@ type Config struct {
 	// write distribution and random selection of padding amounts.
 	AggressivePadding int
 
-	// AggressiveRatio sets the max padding ratio for aggressive
+	// AggressivePaddingRatio sets the max padding ratio for aggressive
 	// initial padding.  The total padding is still bounded
 	// by MaxPaddedSize for any given write.
 	AggressivePaddingRatio float64

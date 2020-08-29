@@ -983,23 +983,23 @@ func TestWriteDeadline(t *testing.T) {
 
 type LimiterConn struct {
 	net.Conn
-	MaxPayload   int
-	BytesRead    int
-	BytesWritten int
+	maxPayload   int
+	bytesRead    int
+	bytesWritten int
 }
 
 func (c *LimiterConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
-	c.BytesRead += n
+	c.bytesRead += n
 	return n, err
 }
 
 func (c *LimiterConn) Write(b []byte) (int, error) {
-	if len(b) > c.MaxPayload {
-		return 0, fmt.Errorf("Write exceeded max payload... %v > %v", len(b), c.MaxPayload)
+	if len(b) > c.maxPayload {
+		return 0, fmt.Errorf("Write exceeded max payload... %v > %v", len(b), c.maxPayload)
 	}
 	n, err := c.Conn.Write(b)
-	c.BytesWritten += n
+	c.bytesWritten += n
 	return n, err
 }
 
@@ -1094,14 +1094,14 @@ func TestPsmuxAggressivePadding(t *testing.T) {
 
 	expectMin := agwrites * (hiSize + 16)
 	expectMax := agwrites * int(agr*float64(maxPayload))
-	if lcli.BytesWritten < expectMin || lcli.BytesWritten > expectMax {
-		t.Fatalf("Unexpected aggressive padded write size %v, expected range [%v,%v]", lcli.BytesWritten, expectMin, expectMax)
+	if lcli.bytesWritten < expectMin || lcli.bytesWritten > expectMax {
+		t.Fatalf("Unexpected aggressive padded write size %v, expected range [%v,%v]", lcli.bytesWritten, expectMin, expectMax)
 	}
-	if lcli.BytesRead < expectMin || lcli.BytesRead > expectMax {
-		t.Fatalf("Unexpected aggressive padded read size %v, expected range [%v,%v]", lcli.BytesRead, expectMin, expectMax)
+	if lcli.bytesRead < expectMin || lcli.bytesRead > expectMax {
+		t.Fatalf("Unexpected aggressive padded read size %v, expected range [%v,%v]", lcli.bytesRead, expectMin, expectMax)
 	}
-	lcli.BytesRead = 0 // reset
-	lcli.BytesWritten = 0
+	lcli.bytesRead = 0 // reset
+	lcli.bytesWritten = 0
 
 	// the aggressive regime should be over, and no more padding
 	// should occur since MaxPaddingRatio is 0
@@ -1121,11 +1121,11 @@ func TestPsmuxAggressivePadding(t *testing.T) {
 	}
 
 	expectedSize := nwrites * (hiSize + 8)
-	if lcli.BytesRead != expectedSize {
-		t.Fatalf("Unexpected (normal) padded read size %v, expected %v", lcli.BytesRead, expectedSize)
+	if lcli.bytesRead != expectedSize {
+		t.Fatalf("Unexpected (normal) padded read size %v, expected %v", lcli.bytesRead, expectedSize)
 	}
-	if lcli.BytesWritten != expectedSize {
-		t.Fatalf("Unexpected (normal) padded write size %v, expected %v", lcli.BytesWritten, expectedSize)
+	if lcli.bytesWritten != expectedSize {
+		t.Fatalf("Unexpected (normal) padded write size %v, expected %v", lcli.bytesWritten, expectedSize)
 	}
 }
 
