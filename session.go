@@ -479,6 +479,10 @@ func (s *Session) sendLoop() {
 	if maxPadding > maxPaddedSize {
 		maxPadding = maxPaddedSize
 	}
+	if maxPadding < minPadding {
+		maxPadding = minPadding
+	}
+
 	padBuf := make([]byte, maxPadding)
 	padBuf[0] = byte(s.config.Version)
 	padBuf[1] = cmdNOP
